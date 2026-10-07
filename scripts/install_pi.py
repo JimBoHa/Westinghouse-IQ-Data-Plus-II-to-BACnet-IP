@@ -125,7 +125,9 @@ def render_units(config):
                  "StandardOutput=journal", "StandardError=journal"]
         if oneshot:
             lines.extend(["TimeoutStartSec=30min", "TimeoutStopSec=60s",
-                          "Nice=10", "IOSchedulingClass=idle"])
+                          "Nice=10", "IOSchedulingClass=idle",
+                          "ExecStopPost=" + command_line(python, "-u", live / "db_snapshot.py",
+                                                         "--cleanup-only", database, snapshot)])
         else:
             lines.extend(["Restart=on-failure", f"RestartSec={30 if poll else 5}", "TimeoutStopSec=10"])
             if poll:
