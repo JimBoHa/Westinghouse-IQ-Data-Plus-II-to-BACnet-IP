@@ -75,6 +75,13 @@ The copy and validation share a 25-minute cooperative budget (`db_snapshot.py
 for shutdown, so large databases are not killed after five minutes. Adjust both
 limits together as the database grows; keep the application budget below the
 service timeout. An expired budget preserves the previously published download.
+SIGTERM/SIGINT cancel the copy or validation and remove its temporary files.
+Each destination has an exclusive `.lock` file shared by snapshot creation and
+cleanup. Startup and `ExecStopPost` remove only that destination's abandoned
+`.tmp-<32 hex digits>` copies and their SQLite sidecars, including leftovers
+after SIGKILL or a reboot. Published and live databases are preserved. Manual
+cleanup uses `db_snapshot.py --cleanup-only SOURCE DESTINATION`; it skips an
+active destination. Do not delete the persistent lock file.
 The acquisition database still records every measurement attempt. To refresh the
 download early, run `systemctl --user start iqdata-snapshot.service`. Download
 `http://PI_ADDRESS:8080/database`, or copy `iqdata-latest.sqlite`. Do not copy

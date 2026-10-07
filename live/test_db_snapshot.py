@@ -1,6 +1,10 @@
 """Snapshot safety checks against real SQLite databases; no meter required."""
 from pathlib import Path
+import select
+import signal
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -85,6 +89,103 @@ class SnapshotTests(unittest.TestCase):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
                 db_snapshot.snapshot(self.source, self.destination, max_seconds=budget)
             self.assert_previous_preserved()
+
+    def start_slow_snapshot(self):
+        # Pause inside a real SQLite backup callback, with a partial copy on disk.
+        code = '''
+import sqlite3, sys, time
+sys.path.insert(0, sys.argv[1])
+import db_snapshot
+connect = sqlite3.connect
+class SlowCopy(sqlite3.Connection):
+    def backup(self, target, **kwargs):
+        check = kwargs['progress']
+        def progress(status, remaining, total):
+            print('COPYING', flush=True)
+            while True:
+                check(status, remaining, total)
+                time.sleep(.01)
+        kwargs['progress'] = progress
+        return super().backup(target, **kwargs)
+db_snapshot.sqlite3.connect = lambda *a, **k: connect(*a, factory=SlowCopy, **k)
+db_snapshot.snapshot(sys.argv[2], sys.argv[3], max_seconds=10)
+'''
+        process = subprocess.Popen([sys.executable, "-c", code, str(Path(db_snapshot.__file__).parent),
+                                    str(self.source), str(self.destination)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def finish():
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        self.addCleanup(finish)
+        self.assertTrue(select.select([process.stdout], [], [], 5)[0], "backup did not start")
+        self.assertEqual(process.stdout.readline().strip(), "COPYING")
+        self.assertTrue(list(self.root.glob("download.sqlite.tmp-*")))
+        return process
+
+    def test_sigterm_and_sigint_remove_partial_copy(self):
+        for number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=number):
+                previous = signal.getsignal(number)
+                process = self.start_slow_snapshot()
+                process.send_signal(number)
+                process.communicate(timeout=5)
+                self.assertNotEqual(process.returncode, 0)
+                self.assert_previous_preserved()
+                self.assertEqual(signal.getsignal(number), previous)
+
+    def test_startup_recovers_after_sigkill(self):
+        process = self.start_slow_snapshot()
+        process.kill()
+        process.communicate(timeout=5)
+        abandoned = {p.name for p in self.root.glob("download.sqlite.tmp-*")}
+        self.assertTrue(abandoned)
+        result = db_snapshot.snapshot(self.source, self.destination)
+        self.assertEqual(set(result["orphan_files_removed"]), abandoned)
+        self.assertEqual(list(self.root.glob("download.sqlite.tmp-*")), [])
+        self.assertEqual(result["quick_check"], "ok")
+
+    def test_cleanup_preserves_unrelated_files_and_live_wal(self):
+        owned = self.destination.with_name(self.destination.name + ".tmp-" + "a" * 32)
+        for path in db_snapshot.temporary_paths(owned):
+            path.write_bytes(b"abandoned")
+        unrelated = self.root / "download.sqlite.tmp-not-a-snapshot"
+        unrelated.write_bytes(b"keep")
+        link = self.root / ("download.sqlite.tmp-" + "b" * 32)
+        link.symlink_to(self.source)
+        directory = self.root / ("download.sqlite.tmp-" + "c" * 32)
+        directory.mkdir()
+        result = db_snapshot.cleanup_snapshot(self.source, self.destination)
+        self.assertEqual(len(result["removed"]), 4)
+        self.assertEqual(self.destination.read_bytes(), b"previous published download")
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(Path(str(self.source) + "-wal").is_file())
+        self.assertEqual(self.writer.execute("SELECT COUNT(*) FROM readings").fetchone()[0], 256)
+
+    def test_live_source_matching_temporary_namespace_is_protected(self):
+        protected = self.root / ("download.sqlite.tmp-" + "d" * 32)
+        for path in db_snapshot.temporary_paths(protected):
+            path.write_bytes(b"keep live source and sidecars")
+        self.assertEqual(db_snapshot.cleanup_snapshot(protected, self.destination)["removed"], [])
+        for path in db_snapshot.temporary_paths(protected):
+            self.assertTrue(path.is_file())
+
+    def test_lock_prevents_cleanup_or_concurrent_snapshot(self):
+        process = self.start_slow_snapshot()
+        abandoned = list(self.root.glob("download.sqlite.tmp-*"))
+        for operation in (db_snapshot.cleanup_snapshot, db_snapshot.snapshot):
+            with self.subTest(operation=operation.__name__), self.assertRaises(db_snapshot.SnapshotBusy):
+                operation(self.source, self.destination)
+            self.assertTrue(all(path.exists() for path in abandoned))
+        cleanup = subprocess.run([sys.executable, db_snapshot.__file__, "--cleanup-only",
+                                  str(self.source), str(self.destination)], capture_output=True, text=True)
+        self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+        self.assertIn("cleanup_skipped", cleanup.stdout)
+        process.terminate()
+        process.communicate(timeout=5)
+        self.assert_previous_preserved()
 
 
 if __name__ == "__main__":
