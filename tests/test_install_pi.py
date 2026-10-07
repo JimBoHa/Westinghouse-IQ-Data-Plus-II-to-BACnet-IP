@@ -73,6 +73,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("TimeoutStopSec=60s", units["iqdata-snapshot.service"])
         snapshot = command_arguments(units["iqdata-snapshot.service"])
         self.assertEqual(snapshot[snapshot.index("--max-seconds") + 1], "1500")
+        self.assertEqual(snapshot[snapshot.index("--min-free-gib") + 1], "20")
         cleanup = command_arguments(units["iqdata-snapshot.service"].replace("ExecStart=", "StartIgnored=")
                                     .replace("ExecStopPost=", "ExecStart="))
         self.assertEqual(cleanup[-3:], ["--cleanup-only", str(self.data / "iqdata.sqlite"),

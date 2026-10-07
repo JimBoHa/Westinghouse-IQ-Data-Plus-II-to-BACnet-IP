@@ -1,11 +1,13 @@
 """Snapshot safety checks against real SQLite databases; no meter required."""
 from pathlib import Path
+import json
 import select
 import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -32,8 +34,12 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(self.destination.read_bytes(), b"previous published download")
         self.assertEqual(list(self.root.glob("download.sqlite.tmp-*")), [])
 
+    def snapshot(self, **options):
+        options.setdefault("min_free_bytes", 0)
+        return db_snapshot.snapshot(self.source, self.destination, **options)
+
     def test_wal_snapshot_is_complete_and_standalone(self):
-        result = db_snapshot.snapshot(self.source, self.destination)
+        result = self.snapshot()
         copy = sqlite3.connect(self.destination)
         try:
             self.assertEqual(copy.execute("SELECT COUNT(*) FROM readings").fetchone()[0], 256)
@@ -46,7 +52,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_expired_budget_retains_previous_download(self):
         with self.assertRaises(db_snapshot.SnapshotTimeout):
-            db_snapshot.snapshot(self.source, self.destination, max_seconds=1e-9)
+            self.snapshot(max_seconds=1e-9)
         self.assert_previous_preserved()
 
     def test_deadline_interrupts_sqlite_validation(self):
@@ -65,7 +71,7 @@ class SnapshotTests(unittest.TestCase):
         with patch.object(db_snapshot.sqlite3, "connect", side_effect=controlled_connect), \
                 patch.object(db_snapshot.time, "monotonic", side_effect=lambda: clock[0]):
             with self.assertRaises(db_snapshot.SnapshotTimeout):
-                db_snapshot.snapshot(self.source, self.destination)
+                self.snapshot()
         self.assert_previous_preserved()
 
     def test_deadline_interrupts_sqlite_copy(self):
@@ -81,13 +87,13 @@ class SnapshotTests(unittest.TestCase):
                           connect(*a, factory=SlowCopy, **k)), \
                 patch.object(db_snapshot.time, "monotonic", side_effect=lambda: clock[0]):
             with self.assertRaises(db_snapshot.SnapshotTimeout):
-                db_snapshot.snapshot(self.source, self.destination)
+                self.snapshot()
         self.assert_previous_preserved()
 
     def test_invalid_budget_changes_nothing(self):
         for budget in (0, -1, float("nan"), float("inf")):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
-                db_snapshot.snapshot(self.source, self.destination, max_seconds=budget)
+                self.snapshot(max_seconds=budget)
             self.assert_previous_preserved()
 
     def start_slow_snapshot(self):
@@ -108,7 +114,7 @@ class SlowCopy(sqlite3.Connection):
         kwargs['progress'] = progress
         return super().backup(target, **kwargs)
 db_snapshot.sqlite3.connect = lambda *a, **k: connect(*a, factory=SlowCopy, **k)
-db_snapshot.snapshot(sys.argv[2], sys.argv[3], max_seconds=10)
+db_snapshot.snapshot(sys.argv[2], sys.argv[3], max_seconds=10, min_free_bytes=0)
 '''
         process = subprocess.Popen([sys.executable, "-c", code, str(Path(db_snapshot.__file__).parent),
                                     str(self.source), str(self.destination)],
@@ -140,7 +146,7 @@ db_snapshot.snapshot(sys.argv[2], sys.argv[3], max_seconds=10)
         process.communicate(timeout=5)
         abandoned = {p.name for p in self.root.glob("download.sqlite.tmp-*")}
         self.assertTrue(abandoned)
-        result = db_snapshot.snapshot(self.source, self.destination)
+        result = self.snapshot()
         self.assertEqual(set(result["orphan_files_removed"]), abandoned)
         self.assertEqual(list(self.root.glob("download.sqlite.tmp-*")), [])
         self.assertEqual(result["quick_check"], "ok")
@@ -185,6 +191,75 @@ db_snapshot.snapshot(sys.argv[2], sys.argv[3], max_seconds=10)
         self.assertIn("cleanup_skipped", cleanup.stdout)
         process.terminate()
         process.communicate(timeout=5)
+        self.assert_previous_preserved()
+
+    def test_space_preflight_counts_logical_pages_still_in_live_wal(self):
+        self.assertGreater(Path(str(self.source) + "-wal").stat().st_size,
+                           self.source.stat().st_size)
+        # Enough for the tiny main file, but not for the WAL-resident contents.
+        with patch.object(db_snapshot.shutil, "disk_usage", return_value=SimpleNamespace(free=1024**2)):
+            with self.assertRaises(db_snapshot.SnapshotSpaceError):
+                self.snapshot(min_free_bytes=65536)
+        self.assert_previous_preserved()
+        status = db_snapshot.snapshot_status(self.destination)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_type"], "SnapshotSpaceError")
+        self.assertEqual(status["phase"], "preflight")
+
+    def test_space_loss_during_copy_or_validation_aborts_cleanly(self):
+        connect = sqlite3.connect
+        for stage in ("copy", "validation"):
+            with self.subTest(stage=stage):
+                pressure = [False]
+                clock = [0.0]
+
+                class Pressure(sqlite3.Connection):
+                    def backup(connection, *args, **kwargs):
+                        if stage == "copy":
+                            pressure[0], clock[0] = True, 2.0
+                        return super().backup(*args, **kwargs)
+
+                    def execute(connection, sql, *args, **kwargs):
+                        if stage == "validation" and sql == "PRAGMA quick_check":
+                            pressure[0], clock[0] = True, 2.0
+                        return super().execute(sql, *args, **kwargs)
+
+                with patch.object(db_snapshot.sqlite3, "connect", side_effect=lambda *a, **k:
+                                  connect(*a, factory=Pressure, **k)), \
+                        patch.object(db_snapshot.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(db_snapshot.shutil, "disk_usage", side_effect=lambda _:
+                                     SimpleNamespace(free=0 if pressure[0] else 1024**4)):
+                    with self.assertRaises(db_snapshot.SnapshotSpaceError):
+                        self.snapshot(min_free_bytes=65536)
+                self.assert_previous_preserved()
+
+    def test_failure_retains_last_success_and_exposes_age(self):
+        good = self.snapshot()
+        before = self.destination.read_bytes()
+        with patch.object(db_snapshot.shutil, "disk_usage", return_value=SimpleNamespace(free=0)):
+            with self.assertRaises(db_snapshot.SnapshotSpaceError):
+                self.snapshot(min_free_bytes=65536)
+        status = db_snapshot.snapshot_status(self.destination)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["last_success"], good)
+        self.assertGreaterEqual(status["published_age_seconds"], 0)
+        self.assertEqual(status["published_bytes"], len(before))
+        self.assertEqual(self.destination.read_bytes(), before)
+
+    def test_cleanup_marks_killed_job_failed(self):
+        process = self.start_slow_snapshot()
+        process.kill()
+        process.communicate(timeout=5)
+        self.assertEqual(db_snapshot.snapshot_status(self.destination)["state"], "running")
+        db_snapshot.cleanup_snapshot(self.source, self.destination)
+        self.assertEqual(db_snapshot.snapshot_status(self.destination)["state"], "failed")
+        self.assert_previous_preserved()
+
+    def test_cli_failure_is_machine_readable_and_nonzero(self):
+        result = subprocess.run([sys.executable, db_snapshot.__file__, "--min-free-gib", "1000000000",
+                                 str(self.source), str(self.destination)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr)["error_type"], "SnapshotSpaceError")
         self.assert_previous_preserved()
 
 

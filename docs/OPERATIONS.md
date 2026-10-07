@@ -82,6 +82,17 @@ cleanup. Startup and `ExecStopPost` remove only that destination's abandoned
 after SIGKILL or a reboot. Published and live databases are preserved. Manual
 cleanup uses `db_snapshot.py --cleanup-only SOURCE DESTINATION`; it skips an
 active destination. Do not delete the persistent lock file.
+Before copying, the job requires free space for the database's logical size plus
+20 GiB for ongoing recording (`--min-free-gib 20`). It checks remaining copy
+space during backup and the reserve during validation, aborting safely if either
+filesystem falls below the requirement. This bounds snapshot storage use; archive
+old measurement data separately as the live database grows.
+
+`iqdata-latest.sqlite.status.json` records the running phase, last successful
+snapshot, and any failure. SIGKILL recovery is recorded by post-stop cleanup.
+Use `db_snapshot.py --status-only SOURCE DESTINATION` to include the published
+file's current age in seconds; check for `state=failed` or an increasing age.
+Failures also exit nonzero and emit a JSON error to the service log/journal.
 The acquisition database still records every measurement attempt. To refresh the
 download early, run `systemctl --user start iqdata-snapshot.service`. Download
 `http://PI_ADDRESS:8080/database`, or copy `iqdata-latest.sqlite`. Do not copy
