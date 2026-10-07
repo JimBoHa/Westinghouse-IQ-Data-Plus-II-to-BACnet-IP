@@ -75,6 +75,7 @@ The copy and validation share a 25-minute cooperative budget (`db_snapshot.py
 for shutdown, so large databases are not killed after five minutes. Adjust both
 limits together as the database grows; keep the application budget below the
 service timeout. An expired budget preserves the previously published download.
+
 SIGTERM/SIGINT cancel the copy or validation and remove its temporary files.
 Each destination has an exclusive `.lock` file shared by snapshot creation and
 cleanup. Startup and `ExecStopPost` remove only that destination's abandoned
@@ -82,6 +83,7 @@ cleanup. Startup and `ExecStopPost` remove only that destination's abandoned
 after SIGKILL or a reboot. Published and live databases are preserved. Manual
 cleanup uses `db_snapshot.py --cleanup-only SOURCE DESTINATION`; it skips an
 active destination. Do not delete the persistent lock file.
+
 Before copying, the job requires free space for the database's logical size plus
 20 GiB for ongoing recording (`--min-free-gib 20`). It checks remaining copy
 space during backup and the reserve during validation, aborting safely if either
@@ -93,6 +95,14 @@ snapshot, and any failure. SIGKILL recovery is recorded by post-stop cleanup.
 Use `db_snapshot.py --status-only SOURCE DESTINATION` to include the published
 file's current age in seconds; check for `state=failed` or an increasing age.
 Failures also exit nonzero and emit a JSON error to the service log/journal.
+
+The live WAL read transaction ends immediately after copying. Integrity checking
+then reads only the destination, allowing live WAL checkpoints to proceed.
+Copy and validation durations are reported separately. The old download stays
+available until the new copy passes validation, closes, and is fsynced; publication
+uses an atomic replacement followed by a directory fsync. Existing HTTP downloads
+can finish reading the old file while new requests receive the replacement.
+
 The acquisition database still records every measurement attempt. To refresh the
 download early, run `systemctl --user start iqdata-snapshot.service`. Download
 `http://PI_ADDRESS:8080/database`, or copy `iqdata-latest.sqlite`. Do not copy
