@@ -69,6 +69,10 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("OnUnitInactiveSec=1h", units["iqdata-snapshot.timer"])
         self.assertIn("Nice=10", units["iqdata-snapshot.service"])
         self.assertIn("IOSchedulingClass=idle", units["iqdata-snapshot.service"])
+        self.assertIn("TimeoutStartSec=30min", units["iqdata-snapshot.service"])
+        self.assertIn("TimeoutStopSec=60s", units["iqdata-snapshot.service"])
+        snapshot = command_arguments(units["iqdata-snapshot.service"])
+        self.assertEqual(snapshot[snapshot.index("--max-seconds") + 1], "1500")
         self.assertIn('%%n $$HOME \\"quoted\\"', units["iqdata-poll.service"])
         for name, unit in units.items():
             self.assertNotIn("/bin/sh", unit)

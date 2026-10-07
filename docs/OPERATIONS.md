@@ -70,6 +70,11 @@ the downloadable snapshot requires a second copy. Actual growth varies.
 
 The snapshot timer uses SQLite's online backup API hourly, at reduced CPU and I/O
 priority. Each job reports its duration and checks the copy before publishing it.
+The copy and validation share a 25-minute cooperative budget (`db_snapshot.py
+--max-seconds 1500`). Generated units allow 30 minutes overall and 60 seconds
+for shutdown, so large databases are not killed after five minutes. Adjust both
+limits together as the database grows; keep the application budget below the
+service timeout. An expired budget preserves the previously published download.
 The acquisition database still records every measurement attempt. To refresh the
 download early, run `systemctl --user start iqdata-snapshot.service`. Download
 `http://PI_ADDRESS:8080/database`, or copy `iqdata-latest.sqlite`. Do not copy
