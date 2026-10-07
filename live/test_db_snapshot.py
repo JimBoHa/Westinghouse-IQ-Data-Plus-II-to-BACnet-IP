@@ -262,6 +262,78 @@ db_snapshot.snapshot(sys.argv[2], sys.argv[3], max_seconds=10, min_free_bytes=0)
         self.assertEqual(json.loads(result.stderr)["error_type"], "SnapshotSpaceError")
         self.assert_previous_preserved()
 
+    def test_live_wal_can_checkpoint_while_destination_is_validated(self):
+        connect = sqlite3.connect
+        self.writer.execute("PRAGMA busy_timeout=0")
+        checkpoints = []
+        writer = self.writer
+
+        class CheckpointDuringValidation(sqlite3.Connection):
+            def execute(connection, sql, *args, **kwargs):
+                if sql == "PRAGMA quick_check":
+                    writer.execute("INSERT INTO readings(payload) VALUES ('new live reading')")
+                    writer.commit()
+                    checkpoints.append(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+                return super().execute(sql, *args, **kwargs)
+
+        with patch.object(db_snapshot.sqlite3, "connect", side_effect=lambda *a, **k:
+                          connect(*a, factory=CheckpointDuringValidation, **k)):
+            self.snapshot()
+        self.assertEqual(checkpoints, [(0, 0, 0)], "validation must not pin the live WAL")
+        self.assertEqual(self.writer.execute("SELECT COUNT(*) FROM readings").fetchone()[0], 257)
+        with connect(self.destination) as copied:
+            self.assertEqual(copied.execute("SELECT COUNT(*) FROM readings").fetchone()[0], 256)
+        copied.close()
+
+    def test_copy_remains_consistent_while_live_data_changes(self):
+        connect = sqlite3.connect
+        self.writer.executemany("INSERT INTO readings(payload) VALUES (zeroblob(8192))", [()] * 512)
+        self.writer.commit()
+        writer = self.writer
+        writes = []
+
+        class ConcurrentWrite(sqlite3.Connection):
+            def backup(connection, target, **kwargs):
+                check = kwargs["progress"]
+                def progress(status, remaining, total):
+                    check(status, remaining, total)
+                    if remaining and not writes:
+                        writer.execute("INSERT INTO readings(payload) VALUES ('during backup')")
+                        writer.commit()
+                        writes.append(remaining)
+                kwargs["progress"] = progress
+                return super().backup(target, **kwargs)
+
+        with patch.object(db_snapshot.sqlite3, "connect", side_effect=lambda *a, **k:
+                          connect(*a, factory=ConcurrentWrite, **k)):
+            self.snapshot()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(self.writer.execute("SELECT COUNT(*) FROM readings").fetchone()[0], 769)
+        with connect(self.destination) as copied:
+            self.assertEqual(copied.execute("SELECT COUNT(*) FROM readings").fetchone()[0], 768)
+        copied.close()
+
+    def test_failed_validation_keeps_previous_download(self):
+        connect = sqlite3.connect
+
+        class InvalidCopy(sqlite3.Connection):
+            def execute(connection, sql, *args, **kwargs):
+                if sql == "PRAGMA quick_check":
+                    return SimpleNamespace(fetchall=lambda: [("damaged test copy",)])
+                return super().execute(sql, *args, **kwargs)
+
+        with patch.object(db_snapshot.sqlite3, "connect", side_effect=lambda *a, **k:
+                          connect(*a, factory=InvalidCopy, **k)):
+            with self.assertRaisesRegex(RuntimeError, "integrity check failed"):
+                self.snapshot()
+        self.assert_previous_preserved()
+
+    def test_existing_download_reader_survives_atomic_publication(self):
+        with self.destination.open("rb") as reader:
+            self.snapshot()
+            self.assertEqual(reader.read(), b"previous published download")
+        self.assertTrue(self.destination.read_bytes().startswith(b"SQLite format 3"))
+
 
 if __name__ == "__main__":
     unittest.main()

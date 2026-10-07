@@ -242,39 +242,43 @@ def snapshot(source, destination, *, max_seconds=1500, min_free_bytes=20 * 1024*
 
 def snapshot_locked(source, destination, budget, max_seconds, space, report):
     temporary = destination.with_name(destination.name + ".tmp-" + uuid.uuid4().hex)
+    dst = None
     try:
         budget.check()
-        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True,
-                                     timeout=min(30, max_seconds))) as src:
-            # Hold a fixed WAL read snapshot while new polls keep committing.
-            # Otherwise a large incremental backup can restart after each write.
-            src.execute("BEGIN")
-            src.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
-            report["source_snapshot_utc"] = utc()
-            page_size = src.execute("PRAGMA page_size").fetchone()[0]
-            space.remaining_bytes = src.execute("PRAGMA page_count").fetchone()[0] * page_size
-            space.check(force=True)
-            report.update(phase="copying", source_bytes=space.remaining_bytes, free_bytes=space.free_bytes)
-            write_status(destination, report)
-
-            def copy_progress(_status, remaining, _total):
-                space.remaining_bytes = remaining * page_size
-                budget.check()
-
-            dst = sqlite3.connect(temporary)
-            try:
-                src.backup(dst, pages=1024, sleep=0.01,
-                           progress=copy_progress)
-                budget.check()
-                report.update(phase="validating", free_bytes=space.free_bytes)
+        copy_started = time.monotonic()
+        try:
+            with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True,
+                                         timeout=min(30, max_seconds))) as src:
+                # Pin the WAL view only while copying, so new writes cannot
+                # restart the backup. Closing src releases it before validation.
+                src.execute("BEGIN")
+                src.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+                report["source_snapshot_utc"] = utc()
+                page_size = src.execute("PRAGMA page_size").fetchone()[0]
+                space.remaining_bytes = src.execute("PRAGMA page_count").fetchone()[0] * page_size
+                space.check(force=True)
+                report.update(phase="copying", source_bytes=space.remaining_bytes, free_bytes=space.free_bytes)
                 write_status(destination, report)
-                dst.set_progress_handler(budget.sqlite_progress, 1000)
-                dst.execute("PRAGMA journal_mode=DELETE")
-                if dst.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                    raise RuntimeError("Snapshot integrity check failed")
-            finally:
+
+                def copy_progress(_status, remaining, _total):
+                    space.remaining_bytes = remaining * page_size
+                    budget.check()
+
+                dst = sqlite3.connect(temporary)
+                src.backup(dst, pages=1024, sleep=0.01, progress=copy_progress)
+            copy_seconds = time.monotonic() - copy_started
+            budget.check()
+            report.update(phase="validating", copy_seconds=copy_seconds, free_bytes=space.free_bytes)
+            write_status(destination, report)
+            validation_started = time.monotonic()
+            dst.set_progress_handler(budget.sqlite_progress, 1000)
+            dst.execute("PRAGMA journal_mode=DELETE")
+            if dst.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise RuntimeError("Snapshot integrity check failed")
+            validation_seconds = time.monotonic() - validation_started
+        finally:
+            if dst is not None:
                 dst.close()
-                src.execute("ROLLBACK")
         with temporary.open("rb") as stream:
             os.fsync(stream.fileno())
         space.check(force=True)
@@ -288,6 +292,7 @@ def snapshot_locked(source, destination, budget, max_seconds, space, report):
         return {"snapshot": str(destination), "bytes": destination.stat().st_size,
                 "finished_utc": utc(), "quick_check": "ok",
                 "source_snapshot_utc": report["source_snapshot_utc"],
+                "copy_seconds": copy_seconds, "validation_seconds": validation_seconds,
                 "duration_seconds": time.monotonic() - budget.started}
     except sqlite3.OperationalError:
         # SQLite reports a progress-handler cancellation as "interrupted".
